@@ -36,13 +36,10 @@ const firebaseConfig = {
   appId: "1:252644925644:web:f3a96b5cc45f808c3e6269"
 };
 
-// Inisialisasi Firebase di luar komponen agar tidak re-render
+// Inisialisasi di luar komponen agar stabil
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
-
-// Kita gunakan appId dari config sebagai referensi path path database
-// (Sesuai logika kode asli Anda yang menggunakan variabel 'appId')
 const appId = firebaseConfig.appId; 
 
 const App = () => {
@@ -60,6 +57,8 @@ const App = () => {
 
   const [editingTxId, setEditingTxId] = useState(null);
   const [payDebtMode, setPayDebtMode] = useState(null);
+  
+  // State form transaksi baru
   const [newTx, setNewTx] = useState({ 
     desc: '', 
     amount: '', 
@@ -74,12 +73,11 @@ const App = () => {
   // --- AUTH LOGIC ---
   useEffect(() => {
     const initAuth = async () => {
-      // Cek apakah ada token custom global (biasanya untuk SSR, tapi kita handle aman di sini)
       if (typeof window !== 'undefined' && window.__initial_auth_token) {
         try {
           await signInWithCustomToken(auth, window.__initial_auth_token);
         } catch (e) {
-          console.error("Custom token login failed, falling back to anon", e);
+          console.error("Custom token fail, fallback anon", e);
           await signInAnonymously(auth);
         }
       } else {
@@ -95,7 +93,7 @@ const App = () => {
   useEffect(() => {
     if (!user) return;
 
-    // Fetch Transactions
+    // 1. Ambil Data Transaksi
     const txCol = collection(db, 'artifacts', appId, 'public', 'data', 'transactions');
     const unsubTx = onSnapshot(txCol, (snap) => {
       const docs = snap.docs
@@ -106,20 +104,32 @@ const App = () => {
       setLoading(false);
     }, (err) => console.error("Tx sync error:", err));
 
-    // Fetch User Settings
+    // 2. Ambil Data Settings (Akun, Budget, Hutang)
     const settingsRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'data');
     const unsubSettings = onSnapshot(settingsRef, (snap) => {
       if (snap.exists()) {
         const d = snap.data();
+        const fetchedBudget = d.budget || [];
+        
         setAccounts(d.accounts || []);
-        setBaseBudget(d.budget || []);
+        setBaseBudget(fetchedBudget);
         setDebts(d.debts || []);
+        
         setEditData({
           bankBalance: d.accounts?.find(a => a.type === 'bank')?.balance || 0,
           cashBalance: d.accounts?.find(a => a.type === 'cash')?.balance || 0,
-          budgets: d.budget || [],
+          budgets: fetchedBudget,
           debts: d.debts || []
         });
+
+        // FIX: Update state newTx jika kategori masih kosong saat load awal
+        if (fetchedBudget.length > 0) {
+           setNewTx(prev => ({
+               ...prev,
+               category: prev.category || fetchedBudget[0].category
+           }));
+        }
+
       } else {
         seedInitialData(user.uid);
       }
@@ -187,7 +197,6 @@ const App = () => {
       .reduce((s, t) => s + Number(t.amount || 0), 0),
   [transactions]);
 
-  // LOGIKA SISA ANGGARAN
   const sisaAnggaran = totalPlannedBudget - totalSpent;
 
   const analysisData = useMemo(() => {
@@ -199,46 +208,74 @@ const App = () => {
     return { income, expense, sortedCats: Object.entries(cats).sort((a,b) => b[1]-a[1]).map(([name, val]) => ({ name, val })) };
   }, [transactions]);
 
-  // --- ACTIONS ---
+  // --- ACTIONS (Logika Simpan, Edit, Hapus) ---
   const handleTransaction = async (e) => {
     e.preventDefault();
     if (!user) return;
 
+    // Bersihkan input angka
     const cleanAmount = String(newTx.amount).replace(/[^0-9]/g, '');
     const numericAmount = Number(cleanAmount);
     
+    // FIX BUG KATEGORI: Jika user tidak klik dropdown, paksa pakai kategori pertama
+    let finalCategory = newTx.category;
+    if (!finalCategory && newTx.type === 'out') {
+        finalCategory = baseBudget.length > 0 ? baseBudget[0].category : 'Lain-lain';
+    }
+
     const payload = { 
       ...newTx, 
       userId: user.uid,
-      amount: numericAmount, 
-      timestamp: serverTimestamp(), 
-      date: new Date().toISOString().split('T')[0] 
+      amount: numericAmount,
+      category: finalCategory,
+      // Jika edit, jangan update timestamp agar urutan tidak berubah
+      // Jika baru, gunakan serverTimestamp
+      ...(editingTxId ? {} : { timestamp: serverTimestamp() }),
+      date: newTx.date || new Date().toISOString().split('T')[0] 
     };
 
-    if (editingTxId) {
-      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'transactions', editingTxId), payload);
-    } else {
-      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'transactions'), payload);
+    try {
+      if (editingTxId) {
+        // --- LOGIKA EDIT ---
+        await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'transactions', editingTxId), payload);
+      } else {
+        // --- LOGIKA BARU ---
+        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'transactions'), payload);
 
-      if (payDebtMode) {
-        const settingsRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'data');
-        const updatedDebts = debts.map(d => {
-          if (d.name === payDebtMode.name) {
-            return { ...d, amount: Math.max(0, d.amount - numericAmount) };
-          }
-          return d;
-        });
-        await updateDoc(settingsRef, { debts: updatedDebts });
+        // Update Hutang (Hanya jika tambah baru)
+        if (payDebtMode) {
+          const settingsRef = doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'data');
+          const updatedDebts = debts.map(d => {
+            if (d.name === payDebtMode.name) {
+              return { ...d, amount: Math.max(0, d.amount - numericAmount) };
+            }
+            return d;
+          });
+          await updateDoc(settingsRef, { debts: updatedDebts });
+        }
       }
+      closeModal();
+    } catch (err) {
+      console.error("Gagal menyimpan:", err);
+      alert("Terjadi kesalahan penyimpanan.");
     }
-    closeModal();
   };
 
   const closeModal = () => {
     setIsModalOpen(false);
     setEditingTxId(null);
     setPayDebtMode(null);
-    setNewTx({ desc: '', amount: '', type: 'out', category: baseBudget[0]?.category || 'Lain-lain', fromAccountId: 1, toAccountId: 2 });
+    
+    // Reset form dengan default value yang aman
+    const defaultCat = baseBudget.length > 0 ? baseBudget[0].category : 'Lain-lain';
+    setNewTx({ 
+      desc: '', 
+      amount: '', 
+      type: 'out', 
+      category: defaultCat, 
+      fromAccountId: 1, 
+      toAccountId: 2 
+    });
   };
 
   const handleUpdateSettings = async (e) => {
@@ -274,6 +311,7 @@ const App = () => {
     setIsModalOpen(true);
   };
 
+  // --- HELPERS ---
   const formatIDR = (val) => !showBalances ? "Rp •••••" : new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(val);
 
   const getIcon = (cat) => {
@@ -281,10 +319,10 @@ const App = () => {
     return map[cat] || <Wallet size={18}/>;
   };
 
+  // CRUD Settings Helpers
   const addCategory = () => setEditData({...editData, budgets: [...editData.budgets, { category: 'Kategori Baru', planned: 0 }]});
   const deleteCategory = (i) => { const nb = [...editData.budgets]; nb.splice(i, 1); setEditData({...editData, budgets: nb}); };
   const updateCategory = (i, f, v) => { const nb = [...editData.budgets]; nb[i][f] = f === 'planned' ? Number(v) : v; setEditData({...editData, budgets: nb}); };
-  
   const addDebt = () => setEditData({...editData, debts: [...editData.debts, { name: 'Tagihan Baru', amount: 0, limit: 0 }]});
   const deleteDebt = (i) => { const nd = [...editData.debts]; nd.splice(i, 1); setEditData({...editData, debts: nd}); };
   const updateDebtField = (i, f, v) => { const nd = [...editData.debts]; nd[i][f] = (f === 'amount' || f === 'limit') ? Number(v) : v; setEditData({...editData, debts: nd}); };
@@ -345,7 +383,6 @@ const App = () => {
                 </div>
               </div>
 
-              {/* Bar Sisa Anggaran */}
               <div className="mt-4 pt-4 border-t border-amber-950/5">
                 <div className="flex justify-between items-end mb-1.5">
                   <p className="text-[10px] font-black uppercase">Sisa Uang Anda</p>
@@ -397,21 +434,47 @@ const App = () => {
           </div>
         )}
 
+        {/* --- TAB TRANSAKSI DENGAN FITUR EDIT --- */}
         {activeTab === 'transactions' && (
           <div className="p-4 space-y-4 animate-in fade-in">
             <h2 className="font-black text-amber-900 uppercase tracking-widest ml-1">Riwayat Transaksi</h2>
             <div className="space-y-3">
               {transactions.map(t => (
-                <div key={t.id} onClick={() => { setEditingTxId(t.id); setNewTx(t); setIsModalOpen(true); }} className="bg-white p-5 rounded-[1.5rem] flex justify-between items-center group shadow-sm border border-amber-50 cursor-pointer active:bg-amber-50">
-                  <div className="flex items-center gap-4">
+                <div key={t.id} className="bg-white p-4 rounded-[1.5rem] flex justify-between items-center group shadow-sm border border-amber-50 relative overflow-hidden">
+                  
+                  {/* Bagian Kiri: Klik untuk edit juga bisa */}
+                  <div className="flex items-center gap-4 cursor-pointer flex-1" onClick={() => { setEditingTxId(t.id); setNewTx(t); setIsModalOpen(true); }}>
                     <div className={`p-3 rounded-2xl ${t.type === 'in' ? 'bg-green-100 text-green-700' : t.type === 'out' ? 'bg-red-100 text-red-700' : 'bg-blue-100 text-blue-700'}`}>
                       {t.type === 'in' ? <ArrowDownLeft size={20}/> : t.type === 'out' ? <ArrowUpRight size={20}/> : <ArrowRightLeft size={20}/>}
                     </div>
-                    <div><p className="font-bold text-amber-950 leading-tight">{t.desc || 'Tanpa Catatan'}</p><p className="text-[10px] text-amber-600 uppercase font-black tracking-widest mt-1 opacity-60">{t.type === 'transfer' ? 'Pindah Saldo' : t.category} • {Number(t.fromAccountId) === 1 ? 'Bank' : 'Kas'}</p></div>
+                    <div>
+                      <p className="font-bold text-amber-950 leading-tight line-clamp-1">{t.desc || 'Tanpa Catatan'}</p>
+                      <p className="text-[10px] text-amber-600 uppercase font-black tracking-widest mt-1 opacity-60">
+                        {t.type === 'transfer' ? 'Pindah Saldo' : t.category} • {Number(t.fromAccountId) === 1 ? 'Bank' : 'Kas'}
+                      </p>
+                    </div>
                   </div>
-                  <p className={`font-black text-lg ${t.type === 'in' ? 'text-green-700' : t.type === 'out' ? 'text-red-700' : 'text-blue-700'}`}>{t.type === 'in' ? '+' : t.type === 'out' ? '-' : ''}{formatIDR(t.amount)}</p>
+
+                  {/* Bagian Kanan: Nominal & Tombol Edit */}
+                  <div className="flex items-center gap-3">
+                    <p className={`font-black text-lg ${t.type === 'in' ? 'text-green-700' : t.type === 'out' ? 'text-red-700' : 'text-blue-700'}`}>
+                      {t.type === 'in' ? '+' : t.type === 'out' ? '-' : ''}{formatIDR(t.amount)}
+                    </p>
+                    <button 
+                      onClick={(e) => { 
+                        e.stopPropagation(); 
+                        setEditingTxId(t.id); 
+                        setNewTx(t); 
+                        setIsModalOpen(true); 
+                      }} 
+                      className="p-2 bg-amber-50 text-amber-600 rounded-full hover:bg-amber-200 transition-colors"
+                    >
+                      <Edit2 size={16} />
+                    </button>
+                  </div>
                 </div>
               ))}
+              {transactions.length === 0 && <p className="text-center text-xs opacity-50 font-bold py-10 uppercase">Belum ada transaksi</p>}
             </div>
           </div>
         )}
@@ -469,7 +532,10 @@ const App = () => {
           <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-md" onClick={closeModal} />
           <div className="relative w-full max-w-sm bg-amber-50 rounded-t-[3rem] sm:rounded-[3rem] shadow-2xl p-8 animate-in slide-in-from-bottom duration-300 border-t-2 border-amber-200">
             <div className="flex justify-between items-center mb-6">
-              <h3 className="text-2xl font-black text-amber-900 uppercase tracking-tighter italic">{newTx.type === 'in' ? 'Pemasukan' : newTx.type === 'out' ? 'Pengeluaran' : 'Pindah Saldo'}</h3>
+              {/* Judul Modal Dinamis */}
+              <h3 className="text-2xl font-black text-amber-900 uppercase tracking-tighter italic">
+                {editingTxId ? 'Edit Transaksi' : (newTx.type === 'in' ? 'Pemasukan' : newTx.type === 'out' ? 'Pengeluaran' : 'Pindah Saldo')}
+              </h3>
               <button onClick={closeModal} className="p-3 bg-white text-amber-900 rounded-full shadow-sm"><X size={20} /></button>
             </div>
             <form onSubmit={handleTransaction} className="space-y-5">
