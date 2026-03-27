@@ -3,9 +3,9 @@ import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
   onAuthStateChanged, 
-  GoogleAuthProvider,     // BARU: Provider Google
-  signInWithPopup,        // BARU: Fungsi popup login
-  signOut                 // BARU: Fungsi logout
+  GoogleAuthProvider,     
+  signInWithPopup,        
+  signOut                 
 } from 'firebase/auth';
 import { 
   getFirestore, 
@@ -24,7 +24,7 @@ import {
   Fuel, Utensils, Baby, Receipt, Settings, Edit2, 
   Calendar, Save, Trash2, CheckCircle2, Banknote, 
   Eye, EyeOff, BarChart3, X, AlertCircle, ShoppingBag,
-  Loader2, LogOut // BARU: Icon Logout
+  Loader2, LogOut 
 } from 'lucide-react';
 
 // --- 1. FIREBASE CONFIGURATION ---
@@ -42,38 +42,45 @@ const auth = getAuth(app);
 const db = getFirestore(app);
 const appId = firebaseConfig.appId; 
 
+// Format hari ini (YYYY-MM-DD) dan bulan ini (YYYY-MM)
+const todayStr = new Date().toISOString().split('T')[0];
+const currentMonthStr = todayStr.slice(0, 7);
+
 const App = () => {
   const [user, setUser] = useState(null);
-  const [authLoading, setAuthLoading] = useState(true); // Membedakan loading auth & data
+  const [authLoading, setAuthLoading] = useState(true); 
   const [activeTab, setActiveTab] = useState('dashboard');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [showBalances, setShowBalances] = useState(true);
   
+  // FITUR 2: State untuk Filter Bulan
+  const [selectedMonth, setSelectedMonth] = useState(currentMonthStr);
+  
   const [accounts, setAccounts] = useState([]);
   const [baseBudget, setBaseBudget] = useState([]);
   const [debts, setDebts] = useState([]);
-  const [transactions, setTransactions] = useState([]);
+  const [transactions, setTransactions] = useState([]); // Semua transaksi (untuk hitung saldo)
 
   const [editingTxId, setEditingTxId] = useState(null);
   const [payDebtMode, setPayDebtMode] = useState(null);
   
+  // FITUR 1: Tambah state 'date' dengan default hari ini
   const [newTx, setNewTx] = useState({ 
     desc: '', 
     amount: '', 
     type: 'out', 
     category: '', 
     fromAccountId: 1,
-    toAccountId: 2
+    toAccountId: 2,
+    date: todayStr
   });
 
   const [editData, setEditData] = useState({ bankBalance: 0, cashBalance: 0, budgets: [], debts: [] });
 
   // --- AUTH LOGIC ---
   useEffect(() => {
-    // Kita tidak lagi menggunakan signInAnonymously. 
-    // Hanya mendengarkan perubahan status login.
     const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
       setUser(currentUser);
       setAuthLoading(false);
@@ -87,14 +94,14 @@ const App = () => {
       await signInWithPopup(auth, provider);
     } catch (error) {
       console.error("Login Error:", error);
-      alert("Gagal login dengan Google. Pastikan domain Vercel Anda sudah didaftarkan di Firebase.");
+      alert("Gagal login dengan Google.");
     }
   };
 
   const handleLogout = async () => {
     try {
       await signOut(auth);
-      setTransactions([]); // Bersihkan data di layar saat logout
+      setTransactions([]); 
     } catch (error) {
       console.error("Logout Error:", error);
     }
@@ -110,7 +117,8 @@ const App = () => {
       const docs = snap.docs
         .map(d => ({ id: d.id, ...d.data() }))
         .filter(d => d.userId === user.uid)
-        .sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0));
+        // Sortir dari tanggal paling baru
+        .sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
       setTransactions(docs);
       setLoading(false);
     }, (err) => {
@@ -165,7 +173,17 @@ const App = () => {
     });
   };
 
+  // --- FILTER BULAN (FITUR 2) ---
+  // Kita buat daftar transaksi khusus untuk bulan yang dipilih
+  const filteredTransactions = useMemo(() => {
+    return transactions.filter(t => {
+      const txDate = t.date || (t.timestamp ? new Date(t.timestamp.seconds * 1000).toISOString().split('T')[0] : todayStr);
+      return txDate.startsWith(selectedMonth);
+    });
+  }, [transactions, selectedMonth]);
+
   // --- LOGIKA PERHITUNGAN ---
+  // Saldo Bank & Kas dihitung dari SEMUA TRANSAKSI (Tidak terpengaruh filter bulan)
   const dynamicBalances = useMemo(() => {
     const bal = { 
       bank: Number(accounts.find(a => a.type === 'bank')?.balance || 0), 
@@ -186,40 +204,37 @@ const App = () => {
     return bal;
   }, [accounts, transactions]);
 
+  // Sisa Anggaran & Detail Kategori dihitung dari TRANSAKSI BULAN INI (Terpengaruh filter)
   const computedBudget = useMemo(() => {
     return baseBudget.map(b => {
-      const actual = transactions
-        .filter(t => 
-          t.type === 'out' && 
-          t.category && 
-          t.category.trim().toLowerCase() === b.category.trim().toLowerCase()
-        )
+      const actual = filteredTransactions
+        .filter(t => t.type === 'out' && t.category && t.category.trim().toLowerCase() === b.category.trim().toLowerCase())
         .reduce((sum, t) => sum + Number(t.amount || 0), 0);
       return { ...b, actual };
     });
-  }, [baseBudget, transactions]);
+  }, [baseBudget, filteredTransactions]);
 
-  const currentMonthYear = useMemo(() => new Date().toLocaleDateString('id-ID', { month: 'long', year: 'numeric' }), []);
   const totalPlannedBudget = useMemo(() => baseBudget.reduce((s, b) => s + Number(b.planned), 0), [baseBudget]);
   
   const totalSpent = useMemo(() => 
-    transactions
+    filteredTransactions
       .filter(t => t.type === 'out')
       .reduce((s, t) => s + Number(t.amount || 0), 0),
-  [transactions]);
+  [filteredTransactions]);
 
   const sisaAnggaran = totalPlannedBudget - totalSpent;
 
+  // Data Analisis (Hanya bulan ini)
   const analysisData = useMemo(() => {
-    const filtered = transactions.filter(t => t.type !== 'transfer');
+    const filtered = filteredTransactions.filter(t => t.type !== 'transfer');
     const income = filtered.filter(t => t.type === 'in').reduce((s, t) => s + Number(t.amount), 0);
     const expense = filtered.filter(t => t.type === 'out').reduce((s, t) => s + Number(t.amount), 0);
     const cats = {};
     filtered.filter(t => t.type === 'out').forEach(t => { cats[t.category] = (cats[t.category] || 0) + Number(t.amount); });
     return { income, expense, sortedCats: Object.entries(cats).sort((a,b) => b[1]-a[1]).map(([name, val]) => ({ name, val })) };
-  }, [transactions]);
+  }, [filteredTransactions]);
 
-  // --- ACTIONS (Logika Simpan, Edit, Hapus) ---
+  // --- ACTIONS ---
   const handleTransaction = async (e) => {
     e.preventDefault();
     if (!user) return;
@@ -238,7 +253,7 @@ const App = () => {
       amount: numericAmount,
       category: finalCategory,
       ...(editingTxId ? {} : { timestamp: serverTimestamp() }),
-      date: newTx.date || new Date().toISOString().split('T')[0] 
+      date: newTx.date || todayStr // Pastikan format tanggal tersimpan
     };
 
     try {
@@ -271,7 +286,8 @@ const App = () => {
     setPayDebtMode(null);
     
     const defaultCat = baseBudget.length > 0 ? baseBudget[0].category : 'Lain-lain';
-    setNewTx({ desc: '', amount: '', type: 'out', category: defaultCat, fromAccountId: 1, toAccountId: 2 });
+    // Reset date ke hari ini saat modal ditutup
+    setNewTx({ desc: '', amount: '', type: 'out', category: defaultCat, fromAccountId: 1, toAccountId: 2, date: todayStr });
   };
 
   const handleUpdateSettings = async (e) => {
@@ -296,11 +312,10 @@ const App = () => {
       b.category.toLowerCase().includes('bayar')
     )?.category || baseBudget[0]?.category || 'Lain-lain';
     
-    setNewTx({ desc: `Bayar Tagihan ${debt.name}`, amount: debt.amount, type: 'out', category: defaultCat, fromAccountId: 1, toAccountId: 2 });
+    setNewTx({ desc: `Bayar Tagihan ${debt.name}`, amount: debt.amount, type: 'out', category: defaultCat, fromAccountId: 1, toAccountId: 2, date: todayStr });
     setIsModalOpen(true);
   };
 
-  // --- HELPERS ---
   const formatIDR = (val) => !showBalances ? "Rp •••••" : new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(val);
 
   const getIcon = (cat) => {
@@ -317,14 +332,12 @@ const App = () => {
 
   // --- RENDER SCREEN ---
   
-  // 1. Loading Awal (Cek Status Login)
   if (authLoading) return (
     <div className="min-h-screen flex items-center justify-center bg-amber-50">
       <Loader2 className="animate-spin text-amber-500" size={48} />
     </div>
   );
 
-  // 2. Layar Login (Jika belum login)
   if (!user) return (
     <div className="min-h-screen flex flex-col items-center justify-center bg-amber-50 p-6 relative overflow-hidden">
       <div className="absolute top-[-10%] right-[-10%] w-64 h-64 bg-amber-300 rounded-full mix-blend-multiply filter blur-3xl opacity-50"></div>
@@ -337,10 +350,7 @@ const App = () => {
         <h1 className="text-3xl font-black text-amber-950 mb-2 tracking-tighter">KeuanganKu</h1>
         <p className="text-sm font-bold text-amber-700/60 uppercase tracking-widest mb-8">Kelola Uang Lebih Bijak</p>
         
-        <button 
-          onClick={handleGoogleLogin} 
-          className="w-full bg-white text-slate-800 p-4 rounded-2xl font-black uppercase tracking-widest shadow-[0_10px_20px_rgba(0,0,0,0.05)] border border-amber-100 flex items-center justify-center gap-3 hover:scale-105 transition-all active:scale-95"
-        >
+        <button onClick={handleGoogleLogin} className="w-full bg-white text-slate-800 p-4 rounded-2xl font-black uppercase tracking-widest shadow-[0_10px_20px_rgba(0,0,0,0.05)] border border-amber-100 flex items-center justify-center gap-3 hover:scale-105 transition-all active:scale-95">
           <svg className="w-6 h-6" viewBox="0 0 24 24">
             <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
             <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
@@ -353,7 +363,6 @@ const App = () => {
     </div>
   );
 
-  // 3. Loading Data Transaksi setelah Login
   if (loading) return (
     <div className="min-h-screen flex items-center justify-center bg-amber-50">
       <div className="text-center space-y-4">
@@ -363,16 +372,21 @@ const App = () => {
     </div>
   );
 
-  // 4. Main Aplikasi Dashboard
   return (
     <div className="min-h-screen bg-amber-50 font-sans text-slate-900 max-w-md mx-auto shadow-2xl relative border-x border-amber-100/50">
       <div className="bg-white/70 backdrop-blur-lg px-4 py-4 flex justify-between items-center sticky top-0 z-40 border-b border-amber-100/50 shadow-sm">
-        <div className="flex items-center gap-2">
-          <Calendar size={20} className="text-amber-700" />
-          <h1 className="text-lg font-black text-amber-900 uppercase tracking-tighter">
-            {activeTab === 'analysis' ? 'Laporan' : currentMonthYear}
-          </h1>
+        
+        {/* HEADER & FILTER BULAN */}
+        <div className="flex items-center gap-2 bg-amber-100/50 px-3 py-1.5 rounded-2xl border border-amber-200 shadow-inner">
+          <Calendar size={18} className="text-amber-700" />
+          <input 
+            type="month" 
+            value={selectedMonth}
+            onChange={(e) => setSelectedMonth(e.target.value)}
+            className="bg-transparent text-sm font-black text-amber-900 outline-none uppercase tracking-tighter w-28"
+          />
         </div>
+
         <div className="flex gap-1">
           <button onClick={() => setIsSettingsOpen(true)} className="p-2 hover:bg-amber-100 rounded-full text-amber-700 transition-colors">
             <Settings size={22}/>
@@ -386,7 +400,6 @@ const App = () => {
       <main className="pb-32">
         {activeTab === 'dashboard' && (
           <div className="space-y-6 animate-in fade-in duration-500 p-4">
-            {/* KARTU EMAS UTAMA */}
             <div className="bg-gradient-to-br from-amber-300 via-yellow-400 to-amber-500 text-amber-950 p-6 rounded-3xl shadow-xl relative overflow-hidden border border-amber-200/50">
               <button onClick={() => setShowBalances(!showBalances)} className="absolute top-4 right-4 p-2 bg-white/20 rounded-full">
                 {showBalances ? <Eye size={18}/> : <EyeOff size={18}/>}
@@ -394,22 +407,22 @@ const App = () => {
               
               <div className="flex justify-between border-b border-amber-950/10 pb-4 mb-4">
                 <div>
-                  <p className="text-[10px] font-black uppercase tracking-widest opacity-70">Saldo Bank</p>
+                  <p className="text-[10px] font-black uppercase tracking-widest opacity-70">Saldo Bank Total</p>
                   <h2 className="text-2xl font-bold tracking-tight">{formatIDR(dynamicBalances.bank)}</h2>
                 </div>
                 <div className="text-right">
-                  <p className="text-[10px] font-black uppercase tracking-widest opacity-70">Saldo Kas</p>
+                  <p className="text-[10px] font-black uppercase tracking-widest opacity-70">Saldo Kas Total</p>
                   <h2 className="text-2xl font-bold tracking-tight">{formatIDR(dynamicBalances.cash)}</h2>
                 </div>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
                 <div className="bg-white/20 p-3 rounded-2xl">
-                  <p className="text-[8px] font-black uppercase opacity-60">Total Anggaran</p>
+                  <p className="text-[8px] font-black uppercase opacity-60">Anggaran Bulan Ini</p>
                   <p className="font-bold text-sm">{formatIDR(totalPlannedBudget)}</p>
                 </div>
                 <div className="bg-amber-950/10 p-3 rounded-2xl">
-                  <p className="text-[8px] font-black uppercase opacity-60">Terpakai</p>
+                  <p className="text-[8px] font-black uppercase opacity-60">Terpakai Bulan Ini</p>
                   <p className={`font-black text-sm ${totalSpent > totalPlannedBudget ? 'text-red-900 drop-shadow-sm' : 'text-amber-950'}`}>
                     {formatIDR(totalSpent)}
                   </p>
@@ -418,7 +431,7 @@ const App = () => {
 
               <div className="mt-4 pt-4 border-t border-amber-950/5">
                 <div className="flex justify-between items-end mb-1.5">
-                  <p className="text-[10px] font-black uppercase">Sisa Uang Anda</p>
+                  <p className="text-[10px] font-black uppercase">Sisa Anggaran ({selectedMonth})</p>
                   <p className={`font-black text-sm ${sisaAnggaran < 0 ? 'text-red-900 underline decoration-red-900/50' : ''}`}>
                     {formatIDR(sisaAnggaran)}
                   </p>
@@ -449,7 +462,7 @@ const App = () => {
             </button>
 
             <div className="space-y-4">
-              <h2 className="font-black text-amber-900 uppercase text-xs ml-1 tracking-widest">Detail Per Kategori</h2>
+              <h2 className="font-black text-amber-900 uppercase text-xs ml-1 tracking-widest">Detail Kategori ({selectedMonth})</h2>
               <div className="bg-white/50 p-5 rounded-[2.5rem] space-y-5 border border-amber-100 shadow-sm">
                 {computedBudget.map((item, i) => (
                   <div key={i} className="space-y-2">
@@ -467,12 +480,12 @@ const App = () => {
           </div>
         )}
 
-        {/* --- TAB TRANSAKSI DENGAN FITUR EDIT --- */}
         {activeTab === 'transactions' && (
           <div className="p-4 space-y-4 animate-in fade-in">
             <h2 className="font-black text-amber-900 uppercase tracking-widest ml-1">Riwayat Transaksi</h2>
             <div className="space-y-3">
-              {transactions.map(t => (
+              {/* Gunakan filteredTransactions di sini */}
+              {filteredTransactions.map(t => (
                 <div key={t.id} className="bg-white p-4 rounded-[1.5rem] flex justify-between items-center group shadow-sm border border-amber-50 relative overflow-hidden">
                   
                   <div className="flex items-center gap-4 cursor-pointer flex-1" onClick={() => { setEditingTxId(t.id); setNewTx(t); setIsModalOpen(true); }}>
@@ -482,7 +495,7 @@ const App = () => {
                     <div>
                       <p className="font-bold text-amber-950 leading-tight line-clamp-1">{t.desc || 'Tanpa Catatan'}</p>
                       <p className="text-[10px] text-amber-600 uppercase font-black tracking-widest mt-1 opacity-60">
-                        {t.type === 'transfer' ? 'Pindah Saldo' : t.category} • {Number(t.fromAccountId) === 1 ? 'Bank' : 'Kas'}
+                        {t.date || todayStr} • {t.type === 'transfer' ? 'Pindah Saldo' : t.category} 
                       </p>
                     </div>
                   </div>
@@ -505,19 +518,20 @@ const App = () => {
                   </div>
                 </div>
               ))}
-              {transactions.length === 0 && <p className="text-center text-xs opacity-50 font-bold py-10 uppercase">Belum ada transaksi</p>}
+              {filteredTransactions.length === 0 && <p className="text-center text-xs opacity-50 font-bold py-10 uppercase">Belum ada transaksi di bulan ini</p>}
             </div>
           </div>
         )}
 
         {activeTab === 'analysis' && (
           <div className="p-4 space-y-6 animate-in slide-in-from-right">
-             <h2 className="font-black text-amber-900 uppercase tracking-widest ml-1">Analisa Pengeluaran</h2>
+             <h2 className="font-black text-amber-900 uppercase tracking-widest ml-1">Laporan ({selectedMonth})</h2>
              <div className="bg-white p-6 rounded-[2.5rem] border border-amber-100 shadow-sm space-y-6">
                 <div className="flex justify-between items-end border-b border-amber-50 pb-4">
                   <div><p className="text-[10px] font-black uppercase text-amber-900/40 tracking-widest">Total Keluar</p><p className="text-2xl font-black text-amber-950">{formatIDR(analysisData.expense)}</p></div>
                   <div className="text-right"><p className="text-[10px] font-black uppercase text-green-600/60 tracking-widest">Total Masuk</p><p className="text-lg font-black text-green-700">{formatIDR(analysisData.income)}</p></div>
                 </div>
+                {analysisData.sortedCats.length === 0 && <p className="text-center text-xs opacity-50 font-bold py-4 uppercase">Belum ada data</p>}
                 {analysisData.sortedCats.map((cat, idx) => (
                    <div key={idx} className="space-y-2">
                       <div className="flex justify-between text-sm font-bold text-amber-950"><span>{cat.name}</span><span className="opacity-60">{formatIDR(cat.val)}</span></div>
@@ -574,10 +588,20 @@ const App = () => {
                 <button type="button" onClick={() => setNewTx({...newTx, fromAccountId: 2})} className={`flex-1 py-3 rounded-[1.25rem] font-black uppercase text-[10px] tracking-widest transition-all ${newTx.fromAccountId === 2 ? 'bg-slate-900 text-white' : 'text-amber-700/50'}`}>Kas</button>
               </div>
               <div className="bg-white p-5 rounded-[2rem] border border-amber-100 space-y-4 shadow-sm">
-                <div><label className="text-[10px] font-black text-amber-800/30 uppercase tracking-widest">Keterangan</label><input type="text" className="w-full bg-transparent border-none p-0 mt-1 outline-none font-bold text-amber-950 focus:ring-0" placeholder="Beli apa?" value={newTx.desc} onChange={e => setNewTx({...newTx, desc: e.target.value})} /></div>
+                
+                {/* INPUT TANGGAL BARU */}
+                <div>
+                  <label className="text-[10px] font-black text-amber-800/30 uppercase tracking-widest">Tanggal</label>
+                  <input type="date" className="w-full bg-transparent border-none p-0 mt-1 outline-none font-bold text-amber-950 focus:ring-0" value={newTx.date || todayStr} onChange={e => setNewTx({...newTx, date: e.target.value})} />
+                </div>
+
+                <div>
+                  <label className="text-[10px] font-black text-amber-800/30 uppercase tracking-widest">Keterangan</label>
+                  <input type="text" className="w-full bg-transparent border-none p-0 mt-1 outline-none font-bold text-amber-950 focus:ring-0" placeholder="Beli apa?" value={newTx.desc} onChange={e => setNewTx({...newTx, desc: e.target.value})} />
+                </div>
                 {newTx.type !== 'transfer' && (
                   <div>
-                    <label className="text-[10px] font-black text-amber-800/30 uppercase tracking-widest">Kategori Anggaran</label>
+                    <label className="text-[10px] font-black text-amber-800/30 uppercase tracking-widest">Kategori</label>
                     <select className="w-full bg-transparent border-none p-0 mt-1 outline-none font-bold text-amber-950 focus:ring-0" value={newTx.category} onChange={e => setNewTx({...newTx, category: e.target.value})}>
                       {baseBudget.map(b => <option key={b.category} value={b.category}>{b.category}</option>)}
                       <option value="Lain-lain">Lain-lain</option>
